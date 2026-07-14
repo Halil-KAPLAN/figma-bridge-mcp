@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 12px;
+      background: #1e1e1e;
+      color: #e0e0e0;
+      padding: 12px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .logo { font-size: 16px; }
+    .title { font-weight: 600; font-size: 13px; }
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px;
+      background: #2a2a2a;
+      border-radius: 6px;
+      margin-bottom: 8px;
+    }
+    .dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      background: #666;
+      flex-shrink: 0;
+    }
+    .dot.connected { background: #4caf50; box-shadow: 0 0 6px #4caf50; }
+    .dot.connecting { background: #ff9800; animation: pulse 1s infinite; }
+    .dot.error { background: #f44336; }
+    @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:0.3 } }
+    .status-text { flex: 1; }
+    .log {
+      background: #111;
+      border-radius: 4px;
+      padding: 6px;
+      height: 80px;
+      overflow-y: auto;
+      font-family: monospace;
+      font-size: 10px;
+      color: #888;
+    }
+    .log .entry { margin-bottom: 2px; }
+    .log .ok { color: #4caf50; }
+    .log .err { color: #f44336; }
+    .log .info { color: #64b5f6; }
+    .reconnect-btn {
+      margin-top: 8px;
+      width: 100%;
+      padding: 6px;
+      background: #333;
+      border: 1px solid #444;
+      border-radius: 4px;
+      color: #e0e0e0;
+      cursor: pointer;
+      font-size: 11px;
+    }
+    .reconnect-btn:hover { background: #444; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <span class="logo">🔌</span>
+    <span class="title">Figma Bridge</span>
+  </div>
+
+  <div class="status-row">
+    <div class="dot connecting" id="dot"></div>
+    <span class="status-text" id="statusText">Connecting...</span>
+  </div>
+
+  <div class="log" id="log"></div>
+
+  <button class="reconnect-btn" onclick="reconnect()">↺ Reconnect</button>
+
+  <script>
+    const WS_URL = 'ws://localhost:3055';
+    let ws = null;
+    let reconnectTimer = null;
+
+    function addLog(msg, type = 'info') {
+      const log = document.getElementById('log');
+      const entry = document.createElement('div');
+      entry.className = `entry ${type}`;
+      const time = new Date().toLocaleTimeString([], { hour12: false });
+      entry.textContent = `[${time}] ${msg}`;
+      log.appendChild(entry);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function setStatus(state, text) {
+      const dot = document.getElementById('dot');
+      const statusText = document.getElementById('statusText');
+      dot.className = `dot ${state}`;
+      statusText.textContent = text;
+    }
+
+    function connect() {
+      if (ws) { try { ws.close(); } catch(e) {} }
+
+      setStatus('connecting', 'Connecting to bridge...');
+      addLog('Connecting to ws://localhost:3055', 'info');
+
+      try {
+        ws = new WebSocket(WS_URL);
+      } catch(e) {
+        setStatus('error', 'Failed to create WebSocket');
+        addLog(`Error: ${e.message}`, 'err');
+        scheduleReconnect();
+        return;
+      }
+
+      ws.onopen = () => {
+        setStatus('connected', 'Connected to bridge ✓');
+        addLog('Connected! Your MCP client can now control Figma.', 'ok');
+        if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+        // Identify this connection as a real Figma plugin so the
+        // bridge can tell plugins apart from proxy connections.
+        try { ws.send(JSON.stringify({ type: 'hello', role: 'figma-plugin' })); } catch(e) {}
+      };
+
+      ws.onclose = (e) => {
+        setStatus('error', 'Disconnected — retrying...');
+        addLog(`Disconnected (${e.code})`, 'err');
+        scheduleReconnect();
+      };
+
+      ws.onerror = () => {
+        addLog('WebSocket error. Is server.js running?', 'err');
+      };
+
+      ws.onmessage = async (event) => {
+        let msg;
+        try { msg = JSON.parse(event.data); } catch(e) { return; }
+
+        addLog(`← ${msg.command} (${msg.requestId})`, 'info');
+
+        parent.postMessage({ pluginMessage: {
+          type: 'execute',
+          requestId: msg.requestId,
+          command: msg.command,
+          params: msg.params
+        }}, '*');
+      };
+    }
+
+    window.onmessage = (event) => {
+      const msg = event.data.pluginMessage;
+      if (!msg || msg.type !== 'result') return;
+
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          requestId: msg.requestId,
+          result: msg.result,
+          error: msg.error
+        }));
+        addLog(`→ result (${msg.requestId}) ${msg.error ? '❌' : '✓'}`, msg.error ? 'err' : 'ok');
+      }
+    };
+
+    function scheduleReconnect() {
+      if (!reconnectTimer) {
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          connect();
+        }, 3000);
+      }
+    }
+
+    function reconnect() {
+      if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+      connect();
+    }
+
+    connect();
+  </script>
+</body>
+</html>
