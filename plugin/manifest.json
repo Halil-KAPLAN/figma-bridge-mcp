@@ -1,0 +1,13 @@
+{
+  "name": "Figma Bridge",
+  "id": "figma-bridge-mcp-local",
+  "api": "1.0.0",
+  "main": "code.js",
+  "ui": "ui.html",
+  "editorType": ["figma", "figjam"],
+  "networkAccess": {
+    "allowedDomains": ["*"],
+    "reasoning": "This plugin connects to a local WebSocket server to receive commands from an MCP client",
+    "devAllowedDomains": ["http://localhost:3055", "ws://localhost:3055"]
+  }
+}
