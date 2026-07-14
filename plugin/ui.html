@@ -121,7 +121,7 @@
 
       ws.onopen = () => {
         setStatus('connected', 'Connected to bridge ✓');
-        addLog('Connected! Your MCP client can now control Figma.', 'ok');
+        addLog('Connected! MCP clients can now access Figma.', 'ok');
         if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
         // Identify this connection as a real Figma plugin so the
         // bridge can tell plugins apart from proxy connections.
