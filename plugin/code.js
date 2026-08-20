@@ -76,10 +76,13 @@ async function executeCommand(command, params) {
       const node = figma.getNodeById(id);
       if (!node) throw new Error(`Node not found: ${params.nodeId}`);
       if (!('exportAsync' in node)) throw new Error('Node does not support export');
-      const bytes = await node.exportAsync({
-        format: params.format || 'PNG',
-        constraint: { type: 'SCALE', value: params.scale || 1 }
-      });
+      const format = params.format || 'PNG';
+      // SVG export settings carry no scale constraint; only rasterized
+      // formats take one.
+      const settings = format === 'SVG'
+        ? { format }
+        : { format, constraint: { type: 'SCALE', value: params.scale || 1 } };
+      const bytes = await node.exportAsync(settings);
       // Convert to base64 in chunks. Spreading the whole byte array into
       // String.fromCharCode blows the engine's argument limit (65534) as soon
       // as the export is larger than ~64 KB.
@@ -88,7 +91,7 @@ async function executeCommand(command, params) {
       for (let i = 0; i < bytes.length; i += CHUNK) {
         binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
       }
-      return { format: params.format || 'PNG', base64: btoa(binary) };
+      return { format, name: node.name, byteLength: bytes.length, base64: btoa(binary) };
     }
 
     case 'figma_set_text': {
@@ -164,8 +167,10 @@ async function executeCommand(command, params) {
     }
 
     case 'figma_run_js': {
-      // eval is available in plugin sandbox
-      const fn = new Function('figma', params.code);
+      // eval is available in plugin sandbox. The snippet is wrapped in an async
+      // IIFE so it can `await` at top level and still `return` a value; the
+      // newlines keep a trailing // comment from swallowing the closing bracket.
+      const fn = new Function('figma', `return (async () => {\n${params.code}\n})();`);
       const result = await fn(figma);
       return result !== undefined ? result : { success: true };
     }

@@ -11,7 +11,7 @@ The plugin window shows the bridge connection status, recent connection events, 
 ## Features
 
 - Inspect the current page, selected layers, individual nodes, local styles, variables, and components.
-- Export Figma nodes as PNG, SVG, or PDF.
+- Export Figma nodes as PNG, SVG, or PDF straight to disk.
 - Update text and solid fill colors.
 - Create, move, resize, and delete nodes.
 - Run advanced JavaScript through the Figma Plugin API.
@@ -369,11 +369,25 @@ The AI agent decides which MCP tools to call based on your request. You can also
 
 ### Export
 
-| Tool                | Inputs                                        | Description                                                      |
-| ------------------- | --------------------------------------------- | ---------------------------------------------------------------- |
-| `figma_export_node` | `nodeId`, optional `format`, optional `scale` | Exports a node as `PNG`, `SVG`, or `PDF` and returns base64 data |
+| Tool                | Inputs                                             | Description                                                                     |
+| ------------------- | -------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `figma_export_node` | `nodeId`, optional `format`, `scale`, `outputPath` | Exports a node as `PNG`, `SVG`, or `PDF`, writes the file, and returns its path |
 
-The default export format is PNG and the default scale is `1`.
+The default export format is PNG and the default scale is `1`. `scale` applies to
+`PNG` and `PDF` only; SVG export takes no scale constraint and ignores it.
+
+The export is written to disk rather than returned as inline base64 — a modest PNG
+is hundreds of kilobytes of it, which is expensive for an AI client to carry in
+its context and unusable as an image. The tool returns the file path instead.
+
+`outputPath` may be a full file path or a directory to write into. Without it the
+file lands in `./figma-exports/` relative to the working directory of the MCP
+client process; set `FIGMA_BRIDGE_EXPORT_DIR` to change that default. Generated
+file names combine the layer name with the node ID, for example
+`hero-banner-5005-2330.svg`.
+
+SVG exports up to 16 KB are also returned inline as source, so an icon can be used
+without a second read. Larger SVGs are referenced by path only.
 
 ### Editing
 
@@ -394,6 +408,14 @@ The default export format is PNG and the default scale is `1`.
 | `figma_run_js` | `code` | Runs JavaScript with access to the `figma` Plugin API object |
 
 `figma_run_js` is intended for operations not covered by the dedicated tools. The supplied code runs inside the Figma plugin sandbox and may modify the open document.
+
+The snippet is wrapped in an async function before it runs, so `await` and `return` both work at the top level of the code you pass:
+
+```js
+const node = figma.getNodeById("1:2");
+await node.exportAsync({ format: "SVG" });
+return node.name;
+```
 
 ## Running the Server Manually
 
@@ -514,7 +536,7 @@ This message is normal when another Figma Bridge instance is already running. If
 - The Figma development plugin must remain open during a session.
 - Commands target the most recently connected plugin when multiple plugin windows are open.
 - `figma_get_page` returns the page's direct children rather than recursively expanding the entire document tree. Use `figma_get_node` for more detail.
-- Exports are returned as base64 data; the MCP client is responsible for saving them as files.
+- Exports are written to disk by the MCP server process that received the call, so the file lands next to the client that asked for it rather than on the primary bridge.
 - There is no authentication layer between the local WebSocket server and plugin.
 
 ## Security

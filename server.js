@@ -10,6 +10,8 @@
 
 const { WebSocketServer, WebSocket } = require('ws');
 const readline = require('readline');
+const fs = require('fs');
+const path = require('path');
 
 const WS_PORT = 3055;
 
@@ -256,7 +258,7 @@ async function callTool(name, args, ctx) {
         pendingRequests.set(requestId, { resolve, reject, timeout });
         ws.send(JSON.stringify({ requestId, command: name, params: args }));
       });
-      resultText = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+      resultText = formatToolResult(name, args, result);
     }
   } else {
     // PROXY: Forward to the primary server.
@@ -268,7 +270,10 @@ async function callTool(name, args, ctx) {
       proxyWs.send(JSON.stringify({ _mcpProxy: proxyId, command: name, params: args }));
     });
 
-    resultText = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+    // Written here rather than on the primary, so the file lands next to the
+    // MCP client that asked for it — the primary may be another process, in
+    // another working directory, on the other side of the WSL boundary.
+    resultText = formatToolResult(name, args, result);
   }
 
   return { content: [{ type: 'text', text: resultText }] };
@@ -284,7 +289,7 @@ const MCP_TOOLS = [
   { name: 'figma_get_styles', description: 'Get all local styles (colors, text, effects)', inputSchema: { type: 'object', properties: {} } },
   { name: 'figma_get_variables', description: 'Get all local variables and variable collections', inputSchema: { type: 'object', properties: {} } },
   { name: 'figma_get_components', description: 'Get all local components', inputSchema: { type: 'object', properties: {} } },
-  { name: 'figma_export_node', description: 'Export a node as PNG/SVG (returns base64)', inputSchema: { type: 'object', properties: { nodeId: { type: 'string' }, format: { type: 'string', enum: ['PNG', 'SVG', 'PDF'], default: 'PNG' }, scale: { type: 'number', default: 1 } }, required: ['nodeId'] } },
+  { name: 'figma_export_node', description: 'Export a node as PNG/SVG/PDF. Writes the file to disk and returns its path; small SVGs are also returned inline as source.', inputSchema: { type: 'object', properties: { nodeId: { type: 'string' }, format: { type: 'string', enum: ['PNG', 'SVG', 'PDF'], default: 'PNG' }, scale: { type: 'number', default: 1, description: 'Raster scale, PNG/PDF only. SVG ignores it.' }, outputPath: { type: 'string', description: 'Target file path, or a directory to write into. Defaults to ./figma-exports/ (override with $FIGMA_BRIDGE_EXPORT_DIR).' } }, required: ['nodeId'] } },
   { name: 'figma_set_text', description: 'Change text content of a text node', inputSchema: { type: 'object', properties: { nodeId: { type: 'string' }, text: { type: 'string' } }, required: ['nodeId', 'text'] } },
   { name: 'figma_set_fill', description: 'Change fill color of a node (hex color)', inputSchema: { type: 'object', properties: { nodeId: { type: 'string' }, hex: { type: 'string', description: 'Hex color e.g. "#FF0000"' } }, required: ['nodeId', 'hex'] } },
   { name: 'figma_create_frame', description: 'Create a new frame on current page', inputSchema: { type: 'object', properties: { name: { type: 'string' }, width: { type: 'number' }, height: { type: 'number' }, x: { type: 'number', default: 0 }, y: { type: 'number', default: 0 } }, required: ['name', 'width', 'height'] } },
@@ -292,7 +297,7 @@ const MCP_TOOLS = [
   { name: 'figma_delete_node', description: 'Delete a node by ID', inputSchema: { type: 'object', properties: { nodeId: { type: 'string' } }, required: ['nodeId'] } },
   { name: 'figma_move_node', description: 'Move a node to new x,y position', inputSchema: { type: 'object', properties: { nodeId: { type: 'string' }, x: { type: 'number' }, y: { type: 'number' } }, required: ['nodeId', 'x', 'y'] } },
   { name: 'figma_resize_node', description: 'Resize a node', inputSchema: { type: 'object', properties: { nodeId: { type: 'string' }, width: { type: 'number' }, height: { type: 'number' } }, required: ['nodeId', 'width', 'height'] } },
-  { name: 'figma_run_js', description: 'Run arbitrary Figma Plugin API JavaScript code (advanced)', inputSchema: { type: 'object', properties: { code: { type: 'string' } }, required: ['code'] } }
+  { name: 'figma_run_js', description: 'Run arbitrary Figma Plugin API JavaScript code (advanced). The snippet runs inside an async function, so top-level `await` and `return` both work.', inputSchema: { type: 'object', properties: { code: { type: 'string' } }, required: ['code'] } }
 ];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -309,6 +314,78 @@ function pickFigmaClient(figmaClients) {
     chosen = ws; // Keep the last entry, which is the most recent plugin.
   }
   return chosen;
+}
+
+// ─── Export handling ──────────────────────────────────────────────────────────
+
+const EXPORT_EXTENSIONS = { PNG: 'png', SVG: 'svg', PDF: 'pdf' };
+
+// Above this size an SVG is only referenced by path. Inlining the source is
+// what makes an icon export directly usable; a whole illustration is not.
+const INLINE_SVG_LIMIT = 16000;
+
+// Exports come back from the plugin as base64, which is useless to a caller as
+// inline text — a modest PNG is hundreds of kilobytes of it. Write the file and
+// hand back the path instead. Everything else is passed through as-is.
+function formatToolResult(name, args, result) {
+  if (name === 'figma_export_node' && result && typeof result === 'object' && result.base64) {
+    return saveExport(args, result);
+  }
+  return typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+}
+
+function saveExport(args, result) {
+  const buffer = Buffer.from(result.base64, 'base64');
+  const filePath = resolveExportPath(args, result);
+
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, buffer);
+  } catch (err) {
+    throw new Error(`Export succeeded but writing ${filePath} failed: ${err.message}`);
+  }
+
+  const node = result.name ? ` · node "${result.name}" (${args.nodeId})` : '';
+  const lines = [`Exported ${result.format} → ${filePath}`, `${buffer.length} bytes${node}`];
+
+  if (result.format === 'SVG') {
+    lines.push('');
+    lines.push(buffer.length <= INLINE_SVG_LIMIT
+      ? buffer.toString('utf8')
+      : `SVG source is ${buffer.length} bytes; read the file above instead of inlining it.`);
+  }
+
+  return lines.join('\n');
+}
+
+function resolveExportPath(args, result) {
+  const extension = EXPORT_EXTENSIONS[result.format] || 'bin';
+  const fileName = `${slugify(result.name)}-${String(args.nodeId).replace(/:/g, '-')}.${extension}`;
+
+  if (args.outputPath) {
+    const target = path.resolve(args.outputPath);
+    const isDirectory = /[\\/]$/.test(args.outputPath)
+      || (fs.existsSync(target) && fs.statSync(target).isDirectory());
+    return isDirectory ? path.join(target, fileName) : target;
+  }
+
+  const dir = process.env.FIGMA_BRIDGE_EXPORT_DIR || path.join(process.cwd(), 'figma-exports');
+  return path.join(path.resolve(dir), fileName);
+}
+
+// Turkish letters that either have no decomposition (ı) or decompose to the
+// wrong base letter (İ -> i + combining dot), so NFD alone mangles them.
+const TURKISH_LETTERS = { 'ı': 'i', 'İ': 'i', 'ş': 's', 'Ş': 's', 'ğ': 'g', 'Ğ': 'g' };
+
+function slugify(name) {
+  return String(name || '')
+    .replace(/[ıİşŞğĞ]/g, (ch) => TURKISH_LETTERS[ch])
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '') // Strip the accents NFD split off.
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60) || 'node';
 }
 
 function mcpResult(id, result) { return { jsonrpc: '2.0', id, result }; }
