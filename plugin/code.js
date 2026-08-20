@@ -80,9 +80,15 @@ async function executeCommand(command, params) {
         format: params.format || 'PNG',
         constraint: { type: 'SCALE', value: params.scale || 1 }
       });
-      // Convert to base64
-      const base64 = btoa(String.fromCharCode(...bytes));
-      return { format: params.format || 'PNG', base64 };
+      // Convert to base64 in chunks. Spreading the whole byte array into
+      // String.fromCharCode blows the engine's argument limit (65534) as soon
+      // as the export is larger than ~64 KB.
+      let binary = '';
+      const CHUNK = 8192;
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+      }
+      return { format: params.format || 'PNG', base64: btoa(binary) };
     }
 
     case 'figma_set_text': {
