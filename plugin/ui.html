@@ -155,6 +155,16 @@
 
         addLog(`← ${msg.command} (${msg.requestId})`, 'info');
 
+        if (msg.command === 'figma_upload_image') {
+          try {
+            msg.params.images = await Promise.all(msg.params.images.map(img => prepareImage(img, msg.params.maxSize)));
+          } catch (e) {
+            ws.send(JSON.stringify({ requestId: msg.requestId, error: `Image decode failed: ${e.message || e}` }));
+            addLog(`→ result (${msg.requestId}) ❌`, 'err');
+            return;
+          }
+        }
+
         parent.postMessage({ pluginMessage: {
           type: 'execute',
           requestId: msg.requestId,
@@ -177,6 +187,38 @@
         addLog(`→ result (${msg.requestId}) ${msg.error ? '❌' : '✓'}`, msg.error ? 'err' : 'ok');
       }
     };
+
+    // The sandbox has no canvas, so images are decoded and shrunk here. Figma
+    // only takes PNG/JPEG/GIF up to 4096px; anything else is re-encoded.
+    const FIGMA_TYPES = ['image/png', 'image/jpeg', 'image/gif'];
+    const FIGMA_MAX = 4096;
+
+    function b64ToBytes(b64) {
+      const bin = atob(b64); const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return bytes;
+    }
+
+    function bytesToB64(bytes) {
+      let bin = '';
+      for (let i = 0; i < bytes.length; i += 8192) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+      return btoa(bin);
+    }
+
+    async function prepareImage(img, maxSize) {
+      const limit = Math.min(maxSize || FIGMA_MAX, FIGMA_MAX);
+      const bitmap = await createImageBitmap(new Blob([b64ToBytes(img.base64)], { type: img.mime }));
+      const scale = Math.min(1, limit / Math.max(bitmap.width, bitmap.height));
+      if (scale === 1 && FIGMA_TYPES.includes(img.mime)) { bitmap.close(); return img; }
+      const w = Math.round(bitmap.width * scale), h = Math.round(bitmap.height * scale);
+      const canvas = new OffscreenCanvas(w, h);
+      canvas.getContext('2d').drawImage(bitmap, 0, 0, w, h);
+      bitmap.close();
+      const type = img.mime === 'image/png' ? 'image/png' : 'image/jpeg';
+      const blob = await canvas.convertToBlob({ type, quality: 0.85 });
+      const base64 = bytesToB64(new Uint8Array(await blob.arrayBuffer()));
+      return { name: img.name, mime: type, base64, resized: `${w}x${h}` };
+    }
 
     function scheduleReconnect() {
       if (!reconnectTimer) {
