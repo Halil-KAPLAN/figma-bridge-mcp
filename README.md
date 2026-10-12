@@ -14,7 +14,8 @@ The plugin window shows the bridge connection status, recent connection events, 
 - Export Figma nodes as PNG, SVG, or PDF straight to disk.
 - Update text and solid fill colors.
 - Create, move, resize, and delete nodes.
-- Run advanced JavaScript through the Figma Plugin API.
+- Upload local images into Figma — the server reads the file, the plugin downscales it — without base64 passing through the conversation.
+- Run advanced JavaScript through the Figma Plugin API, inline or from files on disk, with a bundled helper library and errors reported as `file:line`.
 - Use node IDs copied from Figma URLs in either `1:23` or `1-23` format.
 - Connect multiple MCP client processes through a shared local bridge server.
 - Use the Windows Figma desktop app from AI agents running natively on Windows or inside WSL2.
@@ -396,16 +397,44 @@ without a second read. Larger SVGs are referenced by path only.
 | `figma_set_text`     | `nodeId`, `text`                                                             | Replaces the content of a text node                                        |
 | `figma_set_fill`     | `nodeId`, `hex`                                                              | Replaces a node's fills with one solid hex color                           |
 | `figma_create_frame` | `name`, `width`, `height`, optional `x`, optional `y`                        | Creates a frame on the current page                                        |
-| `figma_create_text`  | `text`, optional `x`, optional `y`, optional `fontSize`, optional `parentId` | Creates an Inter Regular text node on the current page or in a parent node |
+| `figma_create_text`  | `text`, optional `x`, `y`, `fontSize`, `fontFamily`, `fontStyle`, `color`, `parentId` | Creates a text node (Inter Regular by default) on the current page or in a parent node |
 | `figma_delete_node`  | `nodeId`                                                                     | Deletes a node                                                             |
 | `figma_move_node`    | `nodeId`, `x`, `y`                                                           | Changes a node's position                                                  |
 | `figma_resize_node`  | `nodeId`, `width`, `height`                                                  | Changes a node's dimensions                                                |
 
+### Images
+
+| Tool                 | Inputs                                                                                                         | Description                                                    |
+| -------------------- | -------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `figma_upload_image` | `path` or `paths`, optional `nodeId`, `parentId`, `name`, `maxSize`, `width`, `x`, `y`, `scaleMode`, `timeoutMs` | Puts local image files into the document and returns their hashes |
+
+The MCP server reads the files itself, so a photo never travels through the AI
+conversation as base64 (an inline base64 photo costs on the order of 100K tokens).
+Paths resolve against the MCP client's working directory, like `outputPath` for
+exports.
+
+- Without `nodeId`, each image becomes a rectangle named after the file, at its
+  natural size (or `width` wide), on the current page or inside `parentId`;
+  several `paths` are laid out left to right.
+- With `nodeId`, the image replaces that node's fills.
+- The result lists each image's `hash`, natural `width`/`height` and `nodeId`. Use
+  the hash in fills (`{ type: 'IMAGE', scaleMode: 'FILL', imageHash }`) from
+  `figma_run_js`. Keep the uploaded node: Figma drops images no node references
+  when the file is saved.
+- PNG, JPEG, GIF, WebP, AVIF and BMP are accepted. The plugin UI decodes them on a
+  canvas, downscales anything larger than `maxSize` (and always to Figma's 4096px
+  limit) and re-encodes formats Figma cannot store. TIFF and HEIC must be
+  converted first.
+
+`figma.createImageAsync('http://localhost:…')` and `fetch` from the plugin do
+**not** work for local files — the request never leaves Figma. Use this tool instead.
+
 ### Advanced
 
-| Tool           | Inputs | Description                                                  |
-| -------------- | ------ | ------------------------------------------------------------ |
-| `figma_run_js` | `code` | Runs JavaScript with access to the `figma` Plugin API object |
+| Tool               | Inputs                                   | Description                                                            |
+| ------------------ | ---------------------------------------- | ---------------------------------------------------------------------- |
+| `figma_run_js`     | `code`, optional `timeoutMs`             | Runs JavaScript with access to the `figma` Plugin API object           |
+| `figma_run_script` | `files`, optional `args`, `timeoutMs`    | Runs JavaScript files from disk as one snippet; `"@helpers"` adds the bundled helper library |
 
 `figma_run_js` is intended for operations not covered by the dedicated tools. The supplied code runs inside the Figma plugin sandbox and may modify the open document.
 
@@ -416,6 +445,55 @@ const node = figma.getNodeById("1:2");
 await node.exportAsync({ format: "SVG" });
 return node.name;
 ```
+
+Both run tools share these behaviours:
+
+- **Errors carry a line number.** A failure is reported as
+  `TypeError: not a function (snippet line 12:4)` for `figma_run_js`, and as
+  `(…/build/hero.js:12:4)` for `figma_run_script`.
+- **Return values are made cloneable.** `figma.mixed` (a Symbol) becomes
+  `"mixed"`, scene nodes become `{ id, name, type, x, y, width, height }`, byte
+  arrays become a length, and functions are dropped. Previously a single Symbol
+  failed the whole call with `Cannot unwrap symbol`.
+- **`timeoutMs`** raises the default 30-second limit (up to 10 minutes) for long
+  builds.
+
+#### Building from files with `figma_run_script`
+
+Long scripts and reusable helpers belong on disk, not in the tool call. The files
+are concatenated in order and run as one snippet, so a helper file defines
+functions the next file uses. `args` is exposed as `ARGS`:
+
+```json
+{ "files": ["@helpers", "design/lib.js", "design/hero.js"], "args": { "page": "Landing" } }
+```
+
+`"@helpers"` resolves to [`snippets/helpers.js`](snippets/helpers.js), a small
+library of Plugin API builders:
+
+| Helper                                                    | Purpose                                                       |
+| --------------------------------------------------------- | ------------------------------------------------------------- |
+| `loadFonts('Inter Regular', …)`                           | Loads fonts; `text()` refuses an unloaded font with a clear message |
+| `hex`, `solid`, `gradient('down'│'right'│'diagonal', stops)`, `radial`, `shadow`, `blur` | Paints and effects                     |
+| `imageFill(hashOrLayerName, scaleMode)`                   | Image paint from an upload hash or the name of an uploaded layer |
+| `frame`, `rect`, `ellipse`, `text`                        | Create a node in a parent with `{ x, y, w, h, fill, radius, stroke, effects, … }` |
+| `styleRange(textNode, part, { font, color, size })`       | Restyle part of a text                                        |
+| `autoLayout(frame, { dir, gap, padding, align })`         | Turn a frame into auto layout                                 |
+| `page(name)`, `replaceChild(parent, name)`                | Find/create and switch to a page; remove a layer before rebuilding it |
+
+```js
+// design/hero.js
+await loadFonts("Inter Regular", "Inter Bold");
+const pg = await page(ARGS.page);
+replaceChild(pg, "Hero");
+const hero = frame(pg, { name: "Hero", w: 1440, h: 800, fills: [imageFill("hero-photo"), gradient("down", [["#000000", 0, 0], ["#000000", 0.7, 1]])] });
+const title = text(hero, "Build faster", { font: "Inter Bold", size: 96, color: "#ffffff", x: 80, y: 520 });
+styleRange(title, "faster", { color: "#f5c542" });
+return hero;
+```
+
+Making each section script idempotent (`replaceChild` first) lets you edit a file
+and rerun only that section.
 
 ## Running the Server Manually
 
@@ -450,6 +528,8 @@ figma-bridge-mcp/
 │   ├── code.js          # Commands executed in the Figma plugin sandbox
 │   ├── ui.html          # Plugin UI and WebSocket client
 │   └── manifest.json    # Figma development plugin manifest
+├── snippets/
+│   └── helpers.js       # Helper library loaded by figma_run_script via "@helpers"
 ├── server.js            # MCP stdio server and WebSocket bridge
 ├── start.bat            # Optional Windows launcher
 ├── package.json         # Node.js package metadata and scripts
@@ -523,12 +603,16 @@ Do not replace the plugin URL with a WSL virtual-machine IP. Windows-to-WSL loca
 
 This message is normal when another Figma Bridge instance is already running. If the proxy cannot connect, stop the unrelated process using port `3055` or change the port consistently in `server.js`, `plugin/ui.html`, and `plugin/manifest.json`.
 
+The first bridge to start owns the port, and it is often one left behind by an earlier session. Requests from every other client pass through it, and it decides the timeout, so an old primary keeps old behaviour after you update. `figma_status` reports the version and pid of the primary and warns when it is older than the client calling it. Stop that process (`ss -ltnp | grep 3055` shows it); a proxy whose primary exits takes the port over, or reconnects to whichever proxy did, within about a second, and the plugin reconnects on its own — no MCP client restart needed.
+
+Each bridge exits as soon as its MCP client closes stdin (a closed window or a crashed session), so finished sessions do not leave servers — or a stale primary — behind. Bridges older than 1.1.0 did not, which is how several of them could pile up on one port.
+
 ### A command times out
 
 - Confirm that the plugin is still open and connected.
 - Confirm that the target document is still open in Figma.
 - Check that the node ID exists in the current document.
-- Retry the request after reconnecting the plugin. Bridge requests time out after 30 seconds.
+- Retry the request after reconnecting the plugin. Bridge requests time out after 30 seconds by default; pass `timeoutMs` (up to 600000) to `figma_run_js`, `figma_run_script` or `figma_upload_image` for long operations.
 
 ## Current Limitations
 

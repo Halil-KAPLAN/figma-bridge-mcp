@@ -9,9 +9,9 @@ figma.ui.onmessage = async (msg) => {
     const { requestId, command, params } = msg;
     try {
       const result = await executeCommand(command, params);
-      figma.ui.postMessage({ type: 'result', requestId, result });
+      figma.ui.postMessage({ type: 'result', requestId, result: toPlain(result) });
     } catch (err) {
-      figma.ui.postMessage({ type: 'result', requestId, error: err.message });
+      figma.ui.postMessage({ type: 'result', requestId, error: describeError(err, command) });
     }
   }
 };
@@ -127,8 +127,15 @@ async function executeCommand(command, params) {
 
     case 'figma_create_text': {
       const text = figma.createText();
-      await figma.loadFontAsync({ family: 'Inter', style: 'Regular' });
+      const fontName = { family: params.fontFamily || 'Inter', style: params.fontStyle || 'Regular' };
+      await figma.loadFontAsync(fontName);
+      text.fontName = fontName;
       text.characters = params.text;
+      if (params.color) {
+        const rgb = hexToRgb(params.color);
+        if (!rgb) throw new Error(`Invalid hex color: ${params.color}`);
+        text.fills = [{ type: 'SOLID', color: rgb }];
+      }
       text.x = params.x || 0;
       text.y = params.y || 0;
       if (params.fontSize) text.fontSize = params.fontSize;
@@ -170,9 +177,44 @@ async function executeCommand(command, params) {
       // eval is available in plugin sandbox. The snippet is wrapped in an async
       // IIFE so it can `await` at top level and still `return` a value; the
       // newlines keep a trailing // comment from swallowing the closing bracket.
+      // The wrapper shifts line numbers by RUN_JS_LINE_OFFSET — see describeError().
       const fn = new Function('figma', `return (async () => {\n${params.code}\n})();`);
       const result = await fn(figma);
       return result !== undefined ? result : { success: true };
+    }
+
+    case 'figma_upload_image': {
+      // The server read the files and the UI already resized them; here they
+      // only become Figma images. An image no node references is dropped when
+      // the file is saved, so every upload lands on a node.
+      const target = params.nodeId ? getNode(params.nodeId) : null;
+      if (target && !('fills' in target)) throw new Error(`Node ${params.nodeId} cannot take an image fill`);
+      const parent = params.parentId ? getNode(params.parentId) : figma.currentPage;
+      if (!('appendChild' in parent)) throw new Error(`Node ${params.parentId} cannot contain children`);
+      const scaleMode = params.scaleMode || 'FILL';
+      let x = params.x || 0;
+      const results = [];
+      for (const img of params.images) {
+        const image = figma.createImage(figma.base64Decode(img.base64));
+        const { width, height } = await image.getSizeAsync();
+        const paint = { type: 'IMAGE', scaleMode, imageHash: image.hash };
+        let node = target;
+        if (node) {
+          node.fills = [paint];
+        } else {
+          node = figma.createRectangle();
+          node.name = img.name;
+          parent.appendChild(node);
+          const w = params.width || width;
+          node.resize(w, Math.round(w * height / width));
+          node.x = x;
+          node.y = params.y || 0;
+          node.fills = [paint];
+          x += node.width + 40;
+        }
+        results.push({ name: img.name, hash: image.hash, width, height, nodeId: node.id, resized: img.resized || null });
+      }
+      return results;
     }
 
     default:
@@ -181,6 +223,48 @@ async function executeCommand(command, params) {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+// Lines `new Function` (2) and the async wrapper (1) put above a run_js snippet.
+const RUN_JS_LINE_OFFSET = 3;
+
+function getNode(nodeId) {
+  const node = figma.getNodeById(String(nodeId).replace(/-/g, ':'));
+  if (!node) throw new Error(`Node not found: ${nodeId}`);
+  return node;
+}
+
+// A bare "not a function" is useless in a 300-line script, so run_js errors
+// carry the snippet line the sandbox stack points at.
+function describeError(err, command) {
+  const message = err && err.message ? `${err.name && err.name !== 'Error' ? err.name + ': ' : ''}${err.message}` : String(err);
+  if (command !== 'figma_run_js' || !err || !err.stack) return message;
+  const m = /<input>:(\d+):(\d+)/.exec(String(err.stack));
+  if (!m) return message;
+  const line = Number(m[1]) - RUN_JS_LINE_OFFSET;
+  return line > 0 ? `${message} (snippet line ${line}:${m[2]})` : message;
+}
+
+// postMessage cannot clone Symbols (figma.mixed), nodes or functions, and a
+// single one used to fail the whole call with "Cannot unwrap symbol".
+function toPlain(value, depth = 0, seen = new Set()) {
+  if (value === null || value === undefined) return value;
+  const t = typeof value;
+  if (t === 'symbol') return 'mixed';
+  if (t === 'function') return undefined;
+  if (t !== 'object') return value;
+  if (value instanceof Uint8Array) return `<${value.length} bytes>`;
+  if (seen.has(value) || depth > 40) return '<circular>';
+  if ('id' in value && 'type' in value && 'removed' in value) return value.removed ? { id: value.id, removed: true } : nodeToInfo(value);
+  seen.add(value);
+  let out;
+  if (Array.isArray(value)) out = value.map(v => toPlain(v, depth + 1, seen));
+  else {
+    out = {};
+    for (const k of Object.keys(value)) { const v = toPlain(value[k], depth + 1, seen); if (v !== undefined) out[k] = v; }
+  }
+  seen.delete(value);
+  return out;
+}
 
 function nodeToInfo(node) {
   return {
