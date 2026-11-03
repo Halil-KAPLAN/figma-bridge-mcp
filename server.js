@@ -269,6 +269,13 @@ async function handleMCPRequest(req, ctx) {
 async function callTool(name, args, ctx) {
   let resultText;
 
+  // stdin is live before the primary/proxy role is settled (so a leaving client is
+  // noticed early); a call that arrives in that window waits instead of failing.
+  for (let waited = 0; !('direct' in ctx); waited += 50) {
+    if (waited >= 10000) throw new Error('The bridge server could not reach the Figma bridge within 10 seconds.');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
   if (name === 'figma_status' && ctx.direct) {
     const { figmaClients } = ctx;
     pickFigmaClient(figmaClients); // Remove stale connections
@@ -277,8 +284,6 @@ async function callTool(name, args, ctx) {
       : '❌ No Figma plugin connected. Open Figma and run the Figma Bridge plugin.') + ` · bridge ${VERSION} (pid ${process.pid}, primary)`;
     return { content: [{ type: 'text', text: resultText }] };
   }
-
-  if (!('direct' in ctx)) throw new Error('The bridge server is still connecting; retry in a moment.');
 
   // Files are read here, in the process the MCP client talks to, so relative
   // paths resolve against the client's working directory in both modes.
@@ -350,6 +355,30 @@ const MAX_UPLOAD_BYTES = 60 * 1024 * 1024;
 const HELPERS_ALIAS = '@helpers';
 const HELPERS_PATH = path.join(__dirname, 'snippets', 'helpers.js');
 
+// A path typed in a prompt is Unicode-NFC; a folder copied from macOS is often
+// NFD ("ö" as o + U+0308), so "Görseller" exists on disk but not as written and
+// the read fails with ENOENT. Try the other forms, then match each component
+// ignoring normalization.
+function resolvePath(p) {
+  const abs = path.resolve(p);
+  if (fs.existsSync(abs)) return abs;
+  for (const form of ['NFC', 'NFD']) {
+    const alt = abs.normalize(form);
+    if (fs.existsSync(alt)) return alt;
+  }
+  let current = path.sep;
+  for (const part of abs.split(path.sep).filter(Boolean)) {
+    let next = path.join(current, part);
+    if (!fs.existsSync(next)) {
+      const hit = fs.readdirSync(current).find((entry) => entry.normalize('NFC') === part.normalize('NFC'));
+      if (!hit) return abs;
+      next = path.join(current, hit);
+    }
+    current = next;
+  }
+  return current;
+}
+
 function prepareRequest(name, args) {
   if (name === 'figma_upload_image') return prepareUpload(args);
   if (name === 'figma_run_script') return prepareScript(args);
@@ -362,7 +391,7 @@ function prepareUpload(args) {
   if (args.nodeId && files.length > 1) throw new Error('`nodeId` takes a single image; pass one `path`');
   let total = 0;
   const images = files.map((file) => {
-    const abs = path.resolve(file);
+    const abs = resolvePath(file);
     const mime = IMAGE_TYPES[path.extname(abs).toLowerCase()];
     if (!mime) throw new Error(`${file}: unsupported image type (PNG, JPEG, GIF, WebP, AVIF or BMP; convert TIFF/HEIC first)`);
     const buffer = fs.readFileSync(abs);
@@ -383,7 +412,7 @@ function prepareScript(args) {
   const sourceMap = [];
   let line = 2;
   for (const file of files) {
-    const abs = file === HELPERS_ALIAS ? HELPERS_PATH : path.resolve(file);
+    const abs = file === HELPERS_ALIAS ? HELPERS_PATH : resolvePath(file);
     const source = fs.readFileSync(abs, 'utf8').replace(/\r\n/g, '\n');
     const lines = source.split('\n').length;
     sourceMap.push({ file: file === HELPERS_ALIAS ? HELPERS_ALIAS : abs, start: line, lines });

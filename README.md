@@ -421,6 +421,7 @@ exports.
   the hash in fills (`{ type: 'IMAGE', scaleMode: 'FILL', imageHash }`) from
   `figma_run_js`. Keep the uploaded node: Figma drops images no node references
   when the file is saved.
+- A path whose accents are stored differently on disk still resolves. A folder copied from macOS often holds `Görseller` as `o` + a combining mark (NFD), while a path typed in a prompt is NFC, so the file "does not exist" as written; the server retries both forms and then matches each path component ignoring normalization. The same applies to `figma_run_script` files.
 - PNG, JPEG, GIF, WebP, AVIF and BMP are accepted. The plugin UI decodes them on a
   canvas, downscales anything larger than `maxSize` (and always to Figma's 4096px
   limit) and re-encodes formats Figma cannot store. TIFF and HEIC must be
