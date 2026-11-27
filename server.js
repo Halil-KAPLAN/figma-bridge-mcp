@@ -35,7 +35,7 @@ ensureStdio();
 tryStartPrimary();
 
 function tryStartPrimary() {
-  const wss = new WebSocketServer({ port: WS_PORT });
+  const wss = new WebSocketServer({ host: '127.0.0.1', port: WS_PORT });
 
   wss.on('error', (err) => {
     if (err.code === 'EADDRINUSE') {
@@ -48,7 +48,7 @@ function tryStartPrimary() {
   });
 
   wss.on('listening', () => {
-    log(`PRIMARY mode — listening at ws://localhost:${WS_PORT}`);
+    log(`PRIMARY mode — listening at ws://127.0.0.1:${WS_PORT}`);
     startPrimary(wss);
   });
 }
@@ -179,7 +179,7 @@ function startProxy() {
   const pendingProxy = new Map();
 
   function connect() {
-    proxyWs = new WebSocket(`ws://localhost:${WS_PORT}`);
+    proxyWs = new WebSocket(`ws://127.0.0.1:${WS_PORT}`);
 
     proxyWs.on('open', () => {
       log('Connected to the primary server');
